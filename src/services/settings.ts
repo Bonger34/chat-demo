@@ -1,4 +1,5 @@
 import { create } from 'zustand'
+import { createId } from '../utils/id.js'
 import type { TtsVoice } from './api/speech.js'
 import { normalizeLocation, type UserLocation } from './location.js'
 
@@ -7,7 +8,7 @@ export type Locale = 'zh-CN' | 'en-US'
 /** 主题偏好；默认跟随系统 */
 export type ThemePreference = 'light' | 'dark' | 'system'
 
-/** 本机设置，存 localStorage：API Key、语言、主题、位置、朗读音色、深度思考与智能搜索开关、侧边栏收起状态 */
+/** 本机设置，存 localStorage：API Key、语言、主题、位置、朗读音色、深度思考与智能搜索开关、侧边栏收起状态、跨设备同步配置 */
 type Settings = {
   apiKey: string | null
   locale: Locale
@@ -17,6 +18,15 @@ type Settings = {
   thinking: boolean
   search: boolean
   siderCollapsed: boolean
+  /** 同步目标仓库，格式 owner/repo；空串表示未配置 */
+  syncRepo: string
+  syncBranch: string
+  syncToken: string | null
+  /** 细粒度 Token 的过期时间（毫秒时间戳）；未知或 classic Token 为 null */
+  syncTokenExpiresAt: number | null
+  syncEnabled: boolean
+  /** 本设备 UUID，用于时间戳相同时的确定性合并 */
+  syncDevice: string
 }
 
 const KEYS = {
@@ -28,6 +38,12 @@ const KEYS = {
   thinking: 'chat-demo:thinking',
   search: 'chat-demo:search',
   siderCollapsed: 'chat-demo:sider-collapsed',
+  syncRepo: 'chat-demo:sync-repo',
+  syncBranch: 'chat-demo:sync-branch',
+  syncToken: 'chat-demo:sync-token',
+  syncTokenExpiresAt: 'chat-demo:sync-token-expiry',
+  syncEnabled: 'chat-demo:sync-enabled',
+  syncDevice: 'chat-demo:sync-device',
 } as const
 
 const read = (key: string) => {
@@ -87,6 +103,22 @@ const initialThemePreference = (): ThemePreference => {
 /** 未保存过时使用服务端默认音色 stella（海星） */
 const initialTtsVoice = (): TtsVoice => (read(KEYS.ttsVoice) === 'tide' ? 'tide' : 'stella')
 
+/** 首次使用时生成并持久化设备 UUID；同步的确定性合并依赖它保持稳定。 */
+const initialSyncDevice = (): string => {
+  const saved = read(KEYS.syncDevice)
+  if (saved) {
+    return saved
+  }
+  const device = createId()
+  write(KEYS.syncDevice, device)
+  return device
+}
+
+const initialSyncTokenExpiresAt = (): number | null => {
+  const saved = Number(read(KEYS.syncTokenExpiresAt))
+  return Number.isFinite(saved) && saved > 0 ? saved : null
+}
+
 export const useSettings = create<Settings>(() => ({
   apiKey: read(KEYS.apiKey),
   locale: initialLocale(),
@@ -96,6 +128,12 @@ export const useSettings = create<Settings>(() => ({
   thinking: read(KEYS.thinking) === 'true',
   search: read(KEYS.search) === 'true',
   siderCollapsed: read(KEYS.siderCollapsed) === 'true',
+  syncRepo: read(KEYS.syncRepo) ?? '',
+  syncBranch: read(KEYS.syncBranch) || 'main',
+  syncToken: read(KEYS.syncToken),
+  syncTokenExpiresAt: initialSyncTokenExpiresAt(),
+  syncEnabled: read(KEYS.syncEnabled) === 'true',
+  syncDevice: initialSyncDevice(),
 }))
 
 export const setLocale = (locale: Locale) => {
@@ -137,4 +175,31 @@ export const setSearch = (search: boolean) => {
 export const setSiderCollapsed = (siderCollapsed: boolean) => {
   write(KEYS.siderCollapsed, String(siderCollapsed))
   useSettings.setState({ siderCollapsed })
+}
+
+export const setSyncRepo = (syncRepo: string) => {
+  write(KEYS.syncRepo, syncRepo)
+  useSettings.setState({ syncRepo })
+}
+
+export const setSyncBranch = (syncBranch: string) => {
+  write(KEYS.syncBranch, syncBranch)
+  useSettings.setState({ syncBranch })
+}
+
+export const setSyncTokenExpiresAt = (syncTokenExpiresAt: number | null) => {
+  write(KEYS.syncTokenExpiresAt, syncTokenExpiresAt === null ? null : String(syncTokenExpiresAt))
+  useSettings.setState({ syncTokenExpiresAt })
+}
+
+export const setSyncToken = (syncToken: string | null) => {
+  write(KEYS.syncToken, syncToken)
+  // Token 换了之后，旧的过期时间不再适用。
+  setSyncTokenExpiresAt(null)
+  useSettings.setState({ syncToken })
+}
+
+export const setSyncEnabled = (syncEnabled: boolean) => {
+  write(KEYS.syncEnabled, String(syncEnabled))
+  useSettings.setState({ syncEnabled })
 }

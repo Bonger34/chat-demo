@@ -22,11 +22,25 @@ import {
   isChineseBrowser,
   setLocale,
   setLocation,
+  setSyncBranch,
+  setSyncEnabled,
+  setSyncRepo,
+  setSyncToken,
   setThemePreference,
   setTtsVoice,
   useSettings,
   type ThemePreference,
 } from '../../services/settings.js'
+import {
+  confirmRemoteReset,
+  dismissRemoteReset,
+  resetSyncTarget,
+  syncNow,
+  useSyncStatus,
+  validateSyncTarget,
+} from '../../services/sync/sync.js'
+import { GitHubError, type GitHubErrorKind } from '../../services/sync/github.js'
+import { parseRepoInput } from '../../services/sync/repoInput.js'
 import { useTranslate, type TranslationKey, type TranslationMessage } from '../../i18n/index.js'
 import { Button } from '../base/Button.js'
 import { Modal } from '../base/Modal.js'
@@ -64,6 +78,7 @@ const SettingsContent = () => {
   const historyImport = useHistoryImport()
   const historyDelete = useHistoryDelete()
   const replacingHistory = useChatStore((state) => state.importingHistory)
+  const needsConfirm = useSyncStatus((state) => state.needsConfirm)
   const historyBusy = historyImport.busy || historyDelete.busy || replacingHistory
   return (
     <>
@@ -106,6 +121,7 @@ const SettingsContent = () => {
               <ApiKeyField editor={apiKeyEditor} />
               <ImportHistory historyImport={historyImport} disabled={historyBusy} />
               <ExportHistory disabled={historyBusy} />
+              <SyncSetting disabled={historyBusy} />
               <SettingCell
                 label={t('deleteAllSessions')}
                 status={null}
@@ -128,7 +144,43 @@ const SettingsContent = () => {
       </Modal>
       {historyImport.file ? <ImportConfirm historyImport={historyImport} /> : null}
       {historyDelete.opened ? <DeleteAllConfirm historyDelete={historyDelete} /> : null}
+      {needsConfirm ? <SyncResetConfirm /> : null}
     </>
+  )
+}
+
+/** 远端被另一台设备清空时的确认；跟随会删除本地全部会话与附件。 */
+const SyncResetConfirm = () => {
+  const t = useTranslate()
+  const [busy, setBusy] = useState(false)
+  const confirm = async () => {
+    setBusy(true)
+    try {
+      await confirmRemoteReset()
+    } catch {
+      showToast({ key: 'syncFailed', type: 'error' })
+    } finally {
+      setBusy(false)
+    }
+  }
+  return (
+    <Modal
+      title={t('syncNeedsConfirmTitle')}
+      className={styles.deleteConfirm}
+      onClose={dismissRemoteReset}
+      footer={
+        <div className={styles.deleteActions} aria-busy={busy}>
+          <Button variant="outlined" autoFocus disabled={busy} onClick={dismissRemoteReset}>
+            {t('syncNeedsConfirmDismiss')}
+          </Button>
+          <Button variant="danger" disabled={busy} onClick={() => void confirm()}>
+            {t('syncNeedsConfirmFollow')}
+          </Button>
+        </div>
+      }
+    >
+      {t('syncNeedsConfirmDescription')}
+    </Modal>
   )
 }
 
@@ -555,5 +607,295 @@ const ExportHistory = ({ disabled }: { disabled: boolean }) => {
         </Button>
       }
     />
+  )
+}
+
+const syncErrorKeys: Record<GitHubErrorKind, TranslationKey> = {
+  auth: 'syncErrorAuth',
+  'not-found': 'syncErrorNotFound',
+  'rate-limit': 'syncErrorRateLimit',
+  network: 'syncErrorNetwork',
+  server: 'syncErrorServer',
+  protocol: 'syncErrorServer',
+}
+
+const syncErrorKey = (error: unknown): TranslationKey =>
+  error instanceof GitHubError ? syncErrorKeys[error.kind] : 'syncErrorServer'
+
+type SyncCheck =
+  | { kind: 'idle' }
+  | { kind: 'checking' }
+  | { kind: 'done'; repo: string; private: boolean; branchExists: boolean }
+  | { kind: 'error'; key: TranslationKey }
+
+/** 一周内到期就提醒，避免同步忽然失效。 */
+const expiryWarningMs = 7 * 24 * 60 * 60 * 1000
+
+/**
+ * 跨设备同步：仓库、分支、Token 三个输入保存到本机，
+ * 手动同步不受自动开关限制；自动开关需要配置完整后才能打开。
+ */
+const SyncSetting = ({ disabled }: { disabled: boolean }) => {
+  const t = useTranslate()
+  const locale = useSettings((state) => state.locale)
+  const syncRepo = useSettings((state) => state.syncRepo)
+  const syncBranch = useSettings((state) => state.syncBranch)
+  const syncToken = useSettings((state) => state.syncToken)
+  const syncEnabled = useSettings((state) => state.syncEnabled)
+  const syncTokenExpiresAt = useSettings((state) => state.syncTokenExpiresAt)
+  const status = useSyncStatus((state) => state.status)
+  const lastSyncedAt = useSyncStatus((state) => state.lastSyncedAt)
+  const lastError = useSyncStatus((state) => state.lastError)
+  const lastErrorKind = useSyncStatus((state) => state.lastErrorKind)
+  const pendingFiles = useSyncStatus((state) => state.pendingFiles)
+  const [repo, setRepo] = useState(syncRepo)
+  const [branch, setBranch] = useState(syncBranch)
+  const [token, setToken] = useState(syncToken ?? '')
+  const [check, setCheck] = useState<SyncCheck>({ kind: 'idle' })
+
+  /** 失焦时保存输入；仓库或分支变化后丢弃旧的远端路径缓存。 */
+  const commit = async () => {
+    let targetChanged = false
+    const parsed = parseRepoInput(repo)
+    const nextRepo = parsed ? `${parsed.owner}/${parsed.repo}` : repo.trim()
+    const nextBranch = branch.trim() || 'main'
+    // 粘贴完整 URL 后统一存成 owner/repo。
+    if (parsed && nextRepo !== repo) {
+      setRepo(nextRepo)
+    }
+    if (nextRepo !== syncRepo) {
+      setSyncRepo(nextRepo)
+      targetChanged = true
+    }
+    if (nextBranch !== syncBranch) {
+      setSyncBranch(nextBranch)
+      targetChanged = true
+    }
+    const nextToken = token.trim()
+    if (nextToken !== (syncToken ?? '')) {
+      setSyncToken(nextToken || null)
+    }
+    if (targetChanged) {
+      await resetSyncTarget()
+    }
+  }
+
+  /** 归一化仓库地址后立即校验；失败原因按类型展示。 */
+  const validate = async () => {
+    const target = parseRepoInput(repo)
+    if (!target) {
+      setCheck({ kind: 'error', key: 'syncInvalidRepo' })
+      return
+    }
+    await commit()
+    setCheck({ kind: 'checking' })
+    try {
+      const result = await validateSyncTarget()
+      setCheck({
+        kind: 'done',
+        repo: `${result.owner}/${result.repo}`,
+        private: result.private,
+        branchExists: result.branchExists,
+      })
+    } catch (error) {
+      setCheck({ kind: 'error', key: syncErrorKey(error) })
+    }
+  }
+
+  const configured =
+    parseRepoInput(repo) !== null && branch.trim() !== '' && token.trim() !== ''
+  const repoInvalid = repo.trim() !== '' && parseRepoInput(repo) === null
+  const showGuide = repo.trim() === '' && token.trim() === ''
+  const checking = check.kind === 'checking'
+
+  const run = async () => {
+    await commit()
+    await syncNow('manual')
+  }
+
+  const errorText = lastErrorKind
+    ? t(syncErrorKeys[lastErrorKind])
+    : lastError
+      ? t('syncLastError', { message: lastError })
+      : null
+  const tokenExpired = syncTokenExpiresAt !== null && syncTokenExpiresAt <= Date.now()
+  const tokenExpiringSoon =
+    syncTokenExpiresAt !== null &&
+    !tokenExpired &&
+    syncTokenExpiresAt - Date.now() < expiryWarningMs
+
+  return (
+    <div className={clsx(styles.cell, styles.sync)}>
+      <div className={styles.syncHeader}>
+        <div className={styles.text}>
+          <div className={styles.label}>{t('syncTitle')}</div>
+          <div className={styles.description}>{t('syncDescription')}</div>
+        </div>
+        <Button
+          variant="outlined"
+          size="m"
+          className={styles.cellButton}
+          disabled={disabled || !configured || status === 'syncing'}
+          onClick={() => void run()}
+        >
+          {t(status === 'syncing' ? 'syncing' : 'syncNow')}
+        </Button>
+      </div>
+      {showGuide ? (
+        <div className={styles.syncGuide}>
+          <div className={styles.syncGuideStep}>
+            <span>{t('syncGuideRepo')}</span>
+            <a
+              className={styles.syncGuideLink}
+              href="https://github.com/new?name=chat-demo-data&visibility=private"
+              target="_blank"
+              rel="noreferrer"
+            >
+              {t('syncGuideRepoAction')}
+            </a>
+          </div>
+          <div className={styles.syncGuideStep}>
+            <span>{t('syncGuideToken')}</span>
+            <a
+              className={styles.syncGuideLink}
+              href="https://github.com/settings/personal-access-tokens/new"
+              target="_blank"
+              rel="noreferrer"
+            >
+              {t('syncGuideTokenAction')}
+            </a>
+          </div>
+          <div className={styles.syncGuideStep}>{t('syncGuidePaste')}</div>
+        </div>
+      ) : null}
+      <div className={styles.syncFields}>
+        <label className={styles.syncField}>
+          <span>{t('syncRepoLabel')}</span>
+          <span className={styles.apiKeyInput}>
+            <input
+              value={repo}
+              placeholder={t('syncRepoPlaceholder')}
+              spellCheck={false}
+              onChange={(event) => {
+                setRepo(event.target.value)
+                setCheck({ kind: 'idle' })
+              }}
+              onBlur={() => void (token.trim() ? validate() : commit())}
+            />
+          </span>
+          {repoInvalid ? <span className={styles.error}>{t('syncInvalidRepo')}</span> : null}
+        </label>
+        <label className={styles.syncField}>
+          <span>{t('syncBranchLabel')}</span>
+          <span className={styles.apiKeyInput}>
+            <input
+              value={branch}
+              placeholder={t('syncBranchPlaceholder')}
+              spellCheck={false}
+              onChange={(event) => {
+                setBranch(event.target.value)
+                setCheck({ kind: 'idle' })
+              }}
+              onBlur={() => void (token.trim() ? validate() : commit())}
+            />
+          </span>
+        </label>
+      </div>
+      <label className={styles.syncField}>
+        <span>{t('syncTokenLabel')}</span>
+        <span className={styles.apiKeyInput}>
+          <input
+            type="password"
+            value={token}
+            placeholder={t('syncTokenPlaceholder')}
+            autoComplete="off"
+            spellCheck={false}
+            onChange={(event) => {
+              setToken(event.target.value)
+              setCheck({ kind: 'idle' })
+            }}
+            onBlur={() =>
+              void (token.trim() && token.trim() !== (syncToken ?? '') ? validate() : commit())
+            }
+          />
+          {token ? (
+            <button
+              type="button"
+              className={styles.confirm}
+              onClick={() => {
+                setToken('')
+                setSyncToken(null)
+                setCheck({ kind: 'idle' })
+              }}
+            >
+              {t('syncTokenClear')}
+            </button>
+          ) : null}
+        </span>
+      </label>
+      <div className={styles.description}>{t('syncTokenHelp')}</div>
+      <div className={styles.syncCheck}>
+        <Button
+          variant="outlined"
+          size="s"
+          disabled={disabled || !configured || checking || status === 'syncing'}
+          onClick={() => void validate()}
+        >
+          {t(checking ? 'syncValidating' : 'syncValidate')}
+        </Button>
+        {check.kind === 'checking' ? (
+          <span className={styles.description}>{t('syncValidating')}</span>
+        ) : check.kind === 'error' ? (
+          <span className={styles.error}>{t(check.key)}</span>
+        ) : check.kind === 'done' ? (
+          <span className={clsx(styles.description, !check.private && styles.warning)}>
+            {check.private
+              ? t('syncConnected', { repo: check.repo })
+              : t('syncPublicRepo')}
+          </span>
+        ) : null}
+      </div>
+      {check.kind === 'done' && !check.branchExists ? (
+        <div className={styles.description}>{t('syncBranchWillCreate')}</div>
+      ) : null}
+      {tokenExpired ? (
+        <div className={styles.error}>{t('syncTokenExpired')}</div>
+      ) : tokenExpiringSoon && syncTokenExpiresAt !== null ? (
+        <div className={styles.warning}>
+          {t('syncTokenExpirySoon', {
+            time: new Date(syncTokenExpiresAt).toLocaleString(locale),
+          })}
+        </div>
+      ) : null}
+      <div className={styles.syncStatus}>
+        <span className={clsx(styles.description, errorText && styles.error)}>
+          {status === 'syncing'
+            ? t('syncing')
+            : errorText
+              ? errorText
+              : lastSyncedAt
+                ? t('syncLastAt', { time: new Date(lastSyncedAt).toLocaleString(locale) })
+                : t('syncNever')}
+        </span>
+        {pendingFiles > 0 ? (
+          <span className={styles.error}>{t('syncPendingFiles', { count: pendingFiles })}</span>
+        ) : null}
+      </div>
+      <label className={styles.syncToggle}>
+        <input
+          type="checkbox"
+          checked={syncEnabled}
+          disabled={!configured}
+          onChange={(event) => {
+            const checked = event.target.checked
+            void commit().then(() => setSyncEnabled(checked))
+          }}
+        />
+        <span className={styles.syncToggleText}>
+          {t('syncAuto')}
+          <span className={styles.description}>{t('syncAutoHint')}</span>
+        </span>
+      </label>
+    </div>
   )
 }
