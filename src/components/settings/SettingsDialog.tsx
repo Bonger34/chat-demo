@@ -622,11 +622,19 @@ const syncErrorKeys: Record<GitHubErrorKind, TranslationKey> = {
 const syncErrorKey = (error: unknown): TranslationKey =>
   error instanceof GitHubError ? syncErrorKeys[error.kind] : 'syncErrorServer'
 
+/** 附在提示后的原始原因，便于区分 5xx、协议异常和本地错误。 */
+const syncErrorDetail = (error: unknown): string => {
+  if (error instanceof GitHubError) {
+    return [error.status ? `HTTP ${error.status}` : '', error.message].filter(Boolean).join(' · ')
+  }
+  return error instanceof Error ? error.message : String(error)
+}
+
 type SyncCheck =
   | { kind: 'idle' }
   | { kind: 'checking' }
   | { kind: 'done'; repo: string; private: boolean; branchExists: boolean }
-  | { kind: 'error'; key: TranslationKey }
+  | { kind: 'error'; key: TranslationKey; detail?: string }
 
 /** 一周内到期就提醒，避免同步忽然失效。 */
 const expiryWarningMs = 7 * 24 * 60 * 60 * 1000
@@ -698,7 +706,7 @@ const SyncSetting = ({ disabled }: { disabled: boolean }) => {
         branchExists: result.branchExists,
       })
     } catch (error) {
-      setCheck({ kind: 'error', key: syncErrorKey(error) })
+      setCheck({ kind: 'error', key: syncErrorKey(error), detail: syncErrorDetail(error) })
     }
   }
 
@@ -846,7 +854,12 @@ const SyncSetting = ({ disabled }: { disabled: boolean }) => {
         {check.kind === 'checking' ? (
           <span className={styles.description}>{t('syncValidating')}</span>
         ) : check.kind === 'error' ? (
-          <span className={styles.error}>{t(check.key)}</span>
+          <span className={styles.error}>
+            {t(check.key)}
+            {check.detail ? (
+              <span className={styles.syncErrorDetail}> ({check.detail})</span>
+            ) : null}
+          </span>
         ) : check.kind === 'done' ? (
           <span className={clsx(styles.description, !check.private && styles.warning)}>
             {check.private

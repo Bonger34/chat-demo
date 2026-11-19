@@ -481,6 +481,12 @@
   gap: 4px;
 }
 
+/* 原始错误详情，弱化显示，避免和主提示抢注意力。 */
+.syncErrorDetail {
+  opacity: 0.75;
+  word-break: break-word;
+}
+
 .syncGuide {
   display: flex;
   flex-direction: column;
