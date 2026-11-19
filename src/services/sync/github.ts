@@ -160,7 +160,8 @@ export class GitHubClient {
 
   /** 仓库基本信息；用于配置校验与公开仓库提示。 */
   async getRepo(): Promise<{ private: boolean; defaultBranch: string }> {
-    const data = await this.request<{ private?: boolean; default_branch?: string }>('/')
+    // 路径不能以 / 结尾：带尾斜杠时 GitHub 的 CORS 预检返回 404，浏览器会误报网络错误。
+    const data = await this.request<{ private?: boolean; default_branch?: string }>('')
     return { private: data?.private === true, defaultBranch: data?.default_branch ?? '' }
   }
 
@@ -202,7 +203,7 @@ export class GitHubClient {
 
   /** 仓库体积（KB），用于判断是否跳过附件。 */
   async getRepoSizeKb(): Promise<number> {
-    const data = await this.request<{ size?: number }>('/')
+    const data = await this.request<{ size?: number }>('')
     return data?.size ?? 0
   }
 

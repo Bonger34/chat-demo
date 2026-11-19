@@ -82,6 +82,17 @@ describe('GitHubClient', () => {
     await expect(client.getRepo()).resolves.toEqual({ private: true, defaultBranch: 'main' })
   })
 
+  it('仓库根路径不带尾斜杠，避免 CORS 预检 404', async () => {
+    const fetchMock = mockFetch(() => json({ private: false, size: 0 }))
+    const client = new GitHubClient(config)
+    await client.getRepo()
+    await client.getRepoSizeKb()
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      'https://api.github.com/repos/alice/chat-data',
+      'https://api.github.com/repos/alice/chat-data',
+    ])
+  })
+
   it('仓库不可见时按未找到处理', async () => {
     mockFetch(() => json({ message: 'Not Found' }, 404))
     const client = new GitHubClient(config)
