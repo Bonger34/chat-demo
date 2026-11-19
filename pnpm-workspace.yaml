@@ -1,0 +1,7 @@
+# pnpm 12 使用 allowBuilds，pnpm 10 使用 onlyBuiltDependencies；两者都声明，
+# 让不同版本的 pnpm 都允许 esbuild 的安装脚本，避免 CI 报 ERR_PNPM_IGNORED_BUILDS。
+allowBuilds:
+  esbuild: true
+
+onlyBuiltDependencies:
+  - esbuild
