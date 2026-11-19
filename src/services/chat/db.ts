@@ -1,8 +1,36 @@
 import { openDB, type DBSchema, type IDBPDatabase } from 'idb'
+import type { Tombstone } from '../sync/merge.js'
 import { toSessionSummary, type Session, type SessionSummary } from './types.js'
 
 /** IndexedDB 存储结构版本；新增或调整存储、索引时递增。 */
-const DB_VERSION = 11
+const DB_VERSION = 12
+
+/** 同步状态固定为单条记录，便于整条读写。 */
+export type SyncState = {
+  id: 'state'
+  /** 上次同步使用的远端 head，用于跳过未变化的拉取。 */
+  lastCommitSha: string | null
+  /** 数据世代；「删除所有对话」后更换。 */
+  epoch: string
+  /** 本地最近一次全局重置的时间，毫秒。 */
+  lastResetAt: number
+  /** 仓库路径 → blob sha，用于只下载变化文件。 */
+  pathShas: Record<string, string>
+  lastSyncedAt: number
+  lastError: string | null
+}
+
+export const SYNC_STATE_ID = 'state' as const
+
+export const emptySyncState = (): SyncState => ({
+  id: SYNC_STATE_ID,
+  lastCommitSha: null,
+  epoch: '',
+  lastResetAt: 0,
+  pathShas: {},
+  lastSyncedAt: 0,
+  lastError: null,
+})
 
 /** 文件原件按附件的本地 id 存储，所有引用同一 id 的消息共用一份；用于缩略图、打开查看，以及没有 serverId 时补传。 */
 export type StoredFile = {
@@ -29,6 +57,10 @@ interface ChatDB extends DBSchema {
    */
   sessionsStaging: { key: string; value: Session }
   filesStaging: { key: string; value: StoredFile }
+  /** 已删除会话的墓碑；永久保留，避免旧设备把删除的会话重新同步回来。 */
+  tombstones: { key: string; value: Tombstone }
+  /** 跨设备同步的本地状态。 */
+  syncState: { key: string; value: SyncState }
 }
 
 let dbPromise: Promise<IDBPDatabase<ChatDB>> | null = null
@@ -57,7 +89,14 @@ const getDB = () =>
   (dbPromise ??= openDB<ChatDB>('chat-demo', DB_VERSION, {
     upgrade(db, _oldVersion, _newVersion, tx) {
       // 初始化当前格式需要的存储与索引，不迁移旧消息。
-      for (const name of ['sessions', 'files', 'sessionsStaging', 'filesStaging'] as const) {
+      for (const name of [
+        'sessions',
+        'files',
+        'sessionsStaging',
+        'filesStaging',
+        'tombstones',
+        'syncState',
+      ] as const) {
         if (!db.objectStoreNames.contains(name)) {
           db.createObjectStore(name, { keyPath: 'id' })
         }
@@ -111,6 +150,8 @@ export const renameSession = async (id: string, title: string): Promise<void> =>
         const session = await sessions.get(id)
         if (session) {
           session.title = title
+          // 同步时按时间戳合并标题，重命名必须留下时间。
+          session.titleAt = Date.now()
           await sessions.put(session)
           await tx.objectStore('sessionSummaries').put(storedSummary(session))
         }
@@ -123,9 +164,12 @@ export const renameSession = async (id: string, title: string): Promise<void> =>
   ])
 }
 
-/** 删除会话，仅清理已无会话引用的本地原件；远端文件不删。 */
+/** 删除会话，仅清理已无会话引用的本地原件；远端文件不删。墓碑与删除在同一事务中写入。 */
 export const deleteSession = async (sessionId: string): Promise<void> => {
-  const tx = (await getDB()).transaction(['sessions', 'sessionSummaries', 'files'], 'readwrite')
+  const tx = (await getDB()).transaction(
+    ['sessions', 'sessionSummaries', 'files', 'tombstones'],
+    'readwrite'
+  )
   await Promise.all([
     (async () => {
       try {
@@ -133,6 +177,7 @@ export const deleteSession = async (sessionId: string): Promise<void> => {
         const summary = await summaries.get(sessionId)
         await tx.objectStore('sessions').delete(sessionId)
         await summaries.delete(sessionId)
+        await tx.objectStore('tombstones').put({ id: sessionId, deletedAt: Date.now() })
         for (const id of summary?.fileIds ?? []) {
           if ((await summaries.index('fileIds').count(id)) === 0) {
             await tx.objectStore('files').delete(id)
@@ -242,6 +287,100 @@ export const commitStaging = async (): Promise<SessionSummary[]> => {
   await Promise.all([move('sessionsStaging', 'sessions'), move('filesStaging', 'files'), tx.done])
   // 直接返回本次提交的列表，调用方无需在替换成功后再发起可能失败的读取。
   return summaries
+}
+
+/** 同步写入所需的全部数据；一次事务落盘，避免合并结果只写入一半。 */
+export type SyncWrite = {
+  /** 需要新增或更新的会话。 */
+  sessions: Session[]
+  /** 需要删除的会话 id（已被墓碑标记或被远端合并移除）。 */
+  deleteSessionIds: string[]
+  /** 墓碑并集；只新增/覆盖，不删除已有记录。 */
+  tombstones: Tombstone[]
+  files: StoredFile[]
+  syncState: SyncState
+}
+
+export const loadAllSessions = async (): Promise<Session[]> => (await getDB()).getAll('sessions')
+
+export const loadTombstones = async (): Promise<Tombstone[]> => (await getDB()).getAll('tombstones')
+
+export const loadSyncState = async (): Promise<SyncState> =>
+  (await (await getDB()).get('syncState', SYNC_STATE_ID)) ?? emptySyncState()
+
+export const saveSyncState = async (syncState: SyncState): Promise<void> => {
+  await (await getDB()).put('syncState', syncState)
+}
+
+/** 单事务写入同步结果：会话、摘要、删除、墓碑、附件与同步状态一起提交。 */
+export const applySyncWrite = async ({
+  sessions,
+  deleteSessionIds,
+  tombstones,
+  files,
+  syncState,
+}: SyncWrite): Promise<void> => {
+  const tx = (await getDB()).transaction(
+    ['sessions', 'sessionSummaries', 'files', 'tombstones', 'syncState'],
+    'readwrite'
+  )
+  await Promise.all([
+    (async () => {
+      try {
+        const sessionStore = tx.objectStore('sessions')
+        const summaries = tx.objectStore('sessionSummaries')
+        const deletedFileIds = new Set<string>()
+        for (const id of deleteSessionIds) {
+          const summary = await summaries.get(id)
+          await sessionStore.delete(id)
+          await summaries.delete(id)
+          // 记下被删会话引用的附件，稍后确认没有其他会话引用再清理。
+          for (const fileId of summary?.fileIds ?? []) {
+            deletedFileIds.add(fileId)
+          }
+        }
+        for (const session of sessions) {
+          await sessionStore.put(session)
+          await summaries.put(storedSummary(session))
+        }
+        for (const tombstone of tombstones) {
+          await tx.objectStore('tombstones').put(tombstone)
+        }
+        for (const file of files) {
+          await tx.objectStore('files').put(file)
+        }
+        for (const fileId of deletedFileIds) {
+          if ((await summaries.index('fileIds').count(fileId)) === 0) {
+            await tx.objectStore('files').delete(fileId)
+          }
+        }
+        await tx.objectStore('syncState').put(syncState)
+      } catch (error) {
+        abortTransaction(tx)
+        throw error
+      }
+    })(),
+    tx.done,
+  ])
+}
+
+/** 跟随远端全局重置：清空会话与附件，保留设置与 API Key。 */
+export const clearAllLocalData = async (): Promise<void> => {
+  const tx = (await getDB()).transaction(
+    ['sessions', 'sessionSummaries', 'files', 'tombstones'],
+    'readwrite'
+  )
+  await Promise.all([
+    async () => {
+      await Promise.all([
+        tx.objectStore('sessions').clear(),
+        tx.objectStore('sessionSummaries').clear(),
+        tx.objectStore('files').clear(),
+        tx.objectStore('tombstones').clear(),
+      ])
+    },
+    tx.done,
+  ])
 }
 
 /** 本地存储失败不打断对话，只在控制台留痕 */

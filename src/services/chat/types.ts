@@ -30,6 +30,8 @@ type MessageBranch = {
   parentId?: string | null
   /** 当前选中的下一条消息；切换版本时保留每条分支原有的选择。 */
   selectedChildId?: string
+  /** 分支选择最后一次变更的时间，跨设备同步时用于按时间戳合并。 */
+  selectedAt?: number
 }
 
 export type UserMessage = MessageBranch & {
@@ -110,6 +112,8 @@ export type Session = {
   title: string
   createdAt: number
   updatedAt: number
+  /** 标题最后一次修改的时间，跨设备同步时用于按时间戳合并。 */
+  titleAt?: number
   /** 包含所有分支的消息，按创建顺序存储。 */
   messages: Message[]
   /** undefined 表示线性消息列表；null 表示空会话。 */
