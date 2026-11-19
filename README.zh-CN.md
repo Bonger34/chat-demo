@@ -43,6 +43,16 @@ API Key 和设置保存在浏览器 localStorage，会话及附件原件保存�
 
 设置 → 数据管理 → 删除所有对话，会在确认后清空全部本地会话、附件原件和未发送的草稿，停止正在生成的回复并回到新对话。API Key 和其他设置保留，已上传到 API 服务的文件不受影响。
 
+## 跨设备同步
+
+设置 → 数据管理 → 跨设备同步可以把会话和图片原件同步到自己的 GitHub 私有仓库，无需自建后端。设置页提供三步向导（[新建私有仓库](https://github.com/new?name=chat-demo-data&visibility=private)、[创建 Token](https://github.com/settings/personal-access-tokens/new)、粘贴并验证），仓库一栏也可以直接粘贴仓库地址。填写 `owner/repo`、分支和 fine-grained PAT（仅授权该仓库，权限 `Contents: Read and write`）后即可手动同步；开启「自动同步」后，页面重新可见时拉取，回复结束后推送。
+
+「验证连接」会检查 Token 权限、分支是否存在以及仓库是否公开。仓库公开时页面会提示对话与图片对任何能访问它的人可见；Token 临近过期时也会提前提醒，已过期则不再自动同步。
+
+同步以 Git 树快照保存：`manifest.json`、每会话一个 `sessions/{id}.json`、内容寻址的 `files/{sha256}`，以及删除标记 `tombstones/`。两端修改按会话与消息 id 并集合并，标题和分支选择按时间戳取较新者；同一会话的分支选择冲突不会丢消息，可通过现有版本切换查看。另一台设备「删除所有对话」后，本机会提示是否跟随清空。
+
+仓库内容为明文，任何能读取该仓库的人都能看到对话与图片；Token 只保存在本机 localStorage，不会上传。设置、API Key、未发送草稿和非图片附件原件不参与同步。
+
 ## 开发
 
 | 命令          | 用途                |
@@ -50,6 +60,7 @@ API Key 和设置保存在浏览器 localStorage，会话及附件原件保存�
 | `pnpm dev`    | 启动开发服务器      |
 | `pnpm build`  | 构建到 `dist/`      |
 | `pnpm type`   | TypeScript 类型检查 |
+| `pnpm test`   | 运行单元测试        |
 | `pnpm lint`   | oxlint 检查         |
 | `pnpm format` | oxfmt 格式化        |
 

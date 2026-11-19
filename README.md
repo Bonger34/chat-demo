@@ -43,6 +43,16 @@ History import and export in Settings use ZIP archives. After confirmation and s
 
 Settings → Data → Delete all chats clears all local conversations, original attachments, and unsent drafts after confirmation. It stops ongoing replies and returns to a new chat. Your API key and settings are preserved; files already uploaded to the API service are not deleted.
 
+## Cross-device sync
+
+Settings → Data → Cross-device sync can sync conversations and original images to your own private GitHub repository without an application backend. The settings page walks through three steps ([create a private repository](https://github.com/new?name=chat-demo-data&visibility=private), [create a token](https://github.com/settings/personal-access-tokens/new), paste and validate), and the repository field accepts a full GitHub URL. Enter `owner/repo`, a branch, and a fine-grained PAT limited to that repository with `Contents: Read and write`, then sync manually or enable auto sync to pull when the page becomes visible and push after replies finish.
+
+Validate connection checks the token permissions, whether the branch exists, and whether the repository is public. A public repository triggers a warning that anyone who can access it can read conversations and images. Tokens nearing expiry are flagged, and expired tokens stop automatic sync.
+
+Sync stores a Git tree snapshot: `manifest.json`, one `sessions/{id}.json` per conversation, content-addressed `files/{sha256}`, and deletion markers under `tombstones/`. Both sides are merged by session and message id; titles and branch selections use the newer timestamp. Conflicting branch selections never drop messages—the other branch stays available through the existing version switcher. If another device clears all chats, this device asks whether to follow the reset.
+
+Repository contents are plaintext: anyone who can read the repository can see conversations and images. The token stays in local localStorage and is never uploaded. Settings, the API key, unsent drafts, and original non-image attachments are not synced.
+
 ## Development
 
 | Command       | Description                  |
@@ -50,6 +60,7 @@ Settings → Data → Delete all chats clears all local conversations, original 
 | `pnpm dev`    | Start the development server |
 | `pnpm build`  | Build into `dist/`           |
 | `pnpm type`   | Run TypeScript type checks   |
+| `pnpm test`   | Run unit tests               |
 | `pnpm lint`   | Lint with oxlint             |
 | `pnpm format` | Format with oxfmt            |
 
