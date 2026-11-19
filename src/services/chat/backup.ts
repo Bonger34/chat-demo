@@ -1,18 +1,10 @@
 import { formatDate } from '../../utils/format.js'
+import { enqueueBackup } from './backupQueue.js'
 import * as db from './db.js'
 import { replaceHistory, useChatStore } from './store.js'
 import type { Session } from './types.js'
 
 export { BackupError } from './history/errors.js'
-
-// 导入、导出与全部删除串行处理，避免读取归档时数据被清空或两个替换事务交错。
-let backupQueue: Promise<unknown> = Promise.resolve()
-
-const enqueueBackup = <T>(run: () => Promise<T>): Promise<T> => {
-  const task = backupQueue.then(run)
-  backupQueue = task.catch(() => {})
-  return task
-}
 
 const backupFileName = (date: Date) => `deepseek_data-${formatDate(date)}.zip`
 
@@ -54,4 +46,7 @@ export const importHistory = (file: File): Promise<number> =>
 export const clearHistory = (): Promise<void> =>
   enqueueBackup(async () => {
     await replaceHistory(async () => {})
+    // 生成新的同步世代，下一次同步会清空远端仓库里的旧对话。
+    const { handleLocalReset } = await import('../sync/sync.js')
+    await handleLocalReset()
   })

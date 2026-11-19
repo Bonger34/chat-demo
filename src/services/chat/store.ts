@@ -5,6 +5,7 @@ import type { ChatModel, CreateMessageRequest } from '../api/types.js'
 import { extractFileIds, getFileErrorCode, isRetryableApiError } from '../api/errors.js'
 import { cancelUpload, describeUploadError, uploadAttachment, useUploads } from '../attachments.js'
 import { useSettings } from '../settings.js'
+import { markAllDirty, markDirty } from '../sync/dirty.js'
 import { appendBranch, getVisibleMessages, normalizeSession, selectVersion } from './branches.js'
 import * as db from './db.js'
 import {
@@ -109,6 +110,8 @@ const sessionAccess = new Map<string, number>()
 const unsavedSessions = new Set<string>()
 /** 保存失败时保留原件，重试成功后才释放。 */
 const pendingFiles = new Map<string, db.StoredFile[]>()
+/** 正在写入的保存任务；同步前等待它们结束，避免读到旧数据。 */
+const saveTasks = new Set<Promise<void>>()
 const deletingSessions = new Set<string>()
 const deletionTasks = new Set<Promise<boolean>>()
 const streamFlushes = new Map<string, () => void>()
@@ -186,9 +189,11 @@ const persist = (sessionId: string) => {
     if (deletingSessions.has(sessionId)) {
       return
     }
+    // 标记为待推送；流式生成期间只累积，等回复结束后由同步层统一推送。
+    markDirty(sessionId)
     const epoch = historyEpoch
     const files = pendingFiles.get(sessionId)
-    void db
+    const task = db
       .saveSession(session, files)
       .then(() => {
         if (epoch !== historyEpoch || !getSession(sessionId)) {
@@ -215,6 +220,8 @@ const persist = (sessionId: string) => {
           }))
         }
       })
+    saveTasks.add(task)
+    void task.finally(() => saveTasks.delete(task))
   }
 }
 
@@ -417,6 +424,8 @@ export const replaceHistory = async (write: () => Promise<void>): Promise<number
     unsavedSessions.clear()
     pendingFiles.clear()
     clearAllDrafts()
+    // 导入或清空后整批数据都变了，全部标记为待推送。
+    markAllDirty(summaries.map((session) => session.id))
     set({
       ready: true,
       initError: false,
@@ -465,7 +474,7 @@ export const renameSession = (id: string, title: string) => {
     titleRequests.delete(controller)
   }
   if (getSession(id)) {
-    updateSession(id, (session) => ({ ...session, title }))
+    updateSession(id, (session) => ({ ...session, title, titleAt: Date.now() }))
     persist(id)
   } else {
     set((state) => ({
@@ -681,7 +690,21 @@ export const selectMessageVersion = (sessionId: string, messageId: string) => {
   if (getStreamController(sessionId)) {
     return
   }
-  updateSession(sessionId, (session) => selectVersion(session, messageId))
+  updateSession(sessionId, (session) => {
+    const next = selectVersion(session, messageId)
+    if (next === session) {
+      return session
+    }
+    // 记录父消息的分支选择时间，同步时按时间戳决定保留哪一端的选择。
+    const selectedAt = Date.now()
+    const parentId = next.messages.find((message) => message.id === messageId)?.parentId
+    return {
+      ...next,
+      messages: next.messages.map((message) =>
+        message.id === parentId ? { ...message, selectedAt } : message
+      ),
+    }
+  })
   persist(sessionId)
 }
 
@@ -1021,7 +1044,9 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
             !get().importingHistory
           ) {
             const title = event.delta.title.trim()
-            updateSession(sessionId, (session) => (session.title ? session : { ...session, title }))
+            updateSession(sessionId, (session) =>
+              session.title ? session : { ...session, title, titleAt: Date.now() }
+            )
             titleRequests.delete(controller)
           }
           reply = applyEvent(reply, event, Date.now(), blockIndexes)
@@ -1091,4 +1116,104 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
     }))
     persist(sessionId)
   }
+}
+
+/** 是否还有回复在流式生成；同步在写入本地数据前检查。 */
+export const hasActiveStreams = (): boolean => Object.keys(get().streaming).length > 0
+
+/** 等待当前所有写库任务结束，供同步读取到最新数据。 */
+export const flushSessions = async (): Promise<void> => {
+  if (get().importingHistory) {
+    return
+  }
+  for (const id of [...unsavedSessions]) {
+    persist(id)
+  }
+  while (saveTasks.size > 0) {
+    await Promise.all([...saveTasks])
+  }
+}
+
+const withoutKeys = <T>(record: Record<string, T>, keys: ReadonlySet<string>) =>
+  Object.fromEntries(Object.entries(record).filter(([key]) => !keys.has(key)))
+
+/** 应用拉取合并结果：会话、墓碑、附件与同步状态在同一事务中落盘，并刷新界面状态。 */
+export const applySyncMerge = async (write: db.SyncWrite): Promise<void> => {
+  if (get().importingHistory || hasActiveStreams()) {
+    throw new Error('Chat is busy, sync merge deferred')
+  }
+  // 让进行中的详情读取失效，避免旧读取把合并后的数据覆盖回去。
+  historyEpoch += 1
+  sessionLoads.clear()
+  await db.applySyncWrite(write)
+  const deleted = new Set(write.deleteSessionIds)
+  for (const id of deleted) {
+    sessionAccess.delete(id)
+    unsavedSessions.delete(id)
+    pendingFiles.delete(id)
+    clearDraft(id)
+  }
+  const summaries = await db.loadSessionSummaries()
+  set((state) => {
+    const merged = Object.fromEntries(
+      write.sessions
+        .filter((session) => Object.hasOwn(state.sessionCache, session.id))
+        .map((session) => [session.id, session])
+    )
+    return {
+      ready: true,
+      sessions: sortSessions(summaries),
+      sessionCache: withoutKeys({ ...state.sessionCache, ...merged }, deleted),
+      sessionLoadErrors: withoutKeys(state.sessionLoadErrors, deleted),
+      sessionSaveErrors: withoutKeys(state.sessionSaveErrors, deleted),
+      activeId: state.activeId !== null && deleted.has(state.activeId) ? null : state.activeId,
+    }
+  })
+  const { activeId } = get()
+  if (activeId !== null && !getSession(activeId)) {
+    void ensureSessionLoaded(activeId)
+  }
+}
+
+/** 跟随远端全局重置：清空本地会话与附件，保留设置与 API Key。 */
+export const applyRemoteReset = async (syncState: db.SyncState): Promise<void> => {
+  if (get().importingHistory || hasActiveStreams()) {
+    throw new Error('Chat is busy, remote reset deferred')
+  }
+  historyEpoch += 1
+  sessionLoads.clear()
+  await db.clearAllLocalData()
+  await db.saveSyncState(syncState)
+  sessionAccess.clear()
+  unsavedSessions.clear()
+  pendingFiles.clear()
+  clearAllDrafts()
+  set({
+    ready: true,
+    initError: false,
+    sessions: [],
+    sessionCache: {},
+    sessionLoadErrors: {},
+    sessionSaveErrors: {},
+    activeId: null,
+  })
+}
+
+/** 其他标签页同步完成后刷新列表，并丢弃已被远端删除的缓存。 */
+export const refreshSessions = async (): Promise<void> => {
+  if (get().importingHistory) {
+    return
+  }
+  const summaries = await db.loadSessionSummaries()
+  const ids = new Set(summaries.map((session) => session.id))
+  set((state) => {
+    const removed = new Set(Object.keys(state.sessionCache).filter((id) => !ids.has(id)))
+    return {
+      sessions: sortSessions(summaries),
+      sessionCache: withoutKeys(state.sessionCache, removed),
+      sessionLoadErrors: withoutKeys(state.sessionLoadErrors, removed),
+      sessionSaveErrors: withoutKeys(state.sessionSaveErrors, removed),
+      activeId: state.activeId !== null && !ids.has(state.activeId) ? null : state.activeId,
+    }
+  })
 }
