@@ -165,14 +165,22 @@ export class GitHubClient {
     return { private: data?.private === true, defaultBranch: data?.default_branch ?? '' }
   }
 
-  /** 分支 head；仓库为空或分支不存在时返回 null。 */
+  /** 分支 head；分支不存在（404）或仓库为空（409）时返回 null。 */
   async getHead(): Promise<string | null> {
-    const data = await this.request<{ object: { sha: string } }>(
-      `/git/ref/heads/${this.branchPath}`,
-      {},
-      true
-    )
-    return data?.object.sha ?? null
+    try {
+      const data = await this.request<{ object: { sha: string } }>(
+        `/git/ref/heads/${this.branchPath}`,
+        {},
+        true
+      )
+      return data?.object.sha ?? null
+    } catch (error) {
+      // 空仓库没有提交，GitHub 对 ref 查询返回 409 而不是 404。
+      if (error instanceof GitHubError && error.status === 409) {
+        return null
+      }
+      throw error
+    }
   }
 
   /** 提交对应的树与父提交；用于在 head 之上创建新提交。 */

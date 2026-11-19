@@ -28,6 +28,12 @@ describe('GitHubClient', () => {
     await expect(client.getHead()).resolves.toBeNull()
   })
 
+  it('空仓库返回 409 时视为没有分支', async () => {
+    mockFetch(() => json({ message: 'Git Repository is empty.' }, 409))
+    const client = new GitHubClient(config)
+    await expect(client.getHead()).resolves.toBeNull()
+  })
+
   it('401 映射为权限错误', async () => {
     mockFetch(() => json({ message: 'Bad credentials' }, 401))
     const client = new GitHubClient(config)
